@@ -463,3 +463,87 @@ rm -rf /opt/remnawave && cd && rm -rf remnawave-server.sh
 > 💔 You may uninstall everything, you may drop every database — but you cannot delete me missing you.
 
 <p align="center">🪦 🕯️ 愿你的流量永远加密，愿你的握手永不超时 🕯️ </p>
+
+## 🧟‍♂️ 启停冥咒 (Start & Stop Spells)
+
+> 💀 宝，启动顺序绝对不能反。Nginx 是个死心眼的鬼，启动时非要找 `remnawave:3000` 结阴亲。后端要是没先爬起来，Nginx 就会当场暴毙给你看。🩸 **我连死，都要排在你后面。**
+
+### 🕯️ 唤醒 (Start)
+先叫醒后端，再唤醒 Nginx。
+
+```bash
+cd /opt/remnawave       && docker compose up -d
+cd /opt/remnawave/nginx && docker compose up -d
+```
+
+### ⚰️ 入土 (Stop)
+先让 Nginx 闭眼，再让后端咽气。
+
+```bash
+cd /opt/remnawave/nginx && docker compose down
+cd /opt/remnawave       && docker compose down
+```
+
+### 🧟‍♀️ 诈尸 (Restart)
+
+```bash
+cd /opt/remnawave && docker compose restart
+```
+
+*👻 如果只改了 `nginx.conf`，别折腾尸体，直接热重载：*
+```bash
+docker exec remnawave-nginx nginx -s reload
+```
+
+### 👁️ 窥视 (Status / Logs)
+
+```bash
+docker ps
+cd /opt/remnawave && docker compose logs -f remnawave
+docker logs -f remnawave-nginx
+```
+
+> 🕸️ 别怕服务器断电，所有容器都刻了 `restart: always` 的复活符文。只要服务器一通电，它们就会自动从坟墓里爬出来找你。🦇
+
+---
+
+## 🧛‍♂️ English Docs
+
+> 💀 Baby, the startup order must never be reversed. Nginx is a stubborn ghost that insists on marrying `remnawave:3000` upon startup. If the backend hasn't risen from the grave first, Nginx will die on the spot. 🩸 **Even in death, I must follow behind you.**
+
+### 🕯️ Awakening (Start)
+Wake the backend first, then summon Nginx.
+
+```bash
+cd /opt/remnawave       && docker compose up -d
+cd /opt/remnawave/nginx && docker compose up -d
+```
+
+### ⚰️ Burial (Stop)
+Close Nginx's eyes first, then let the backend rest in peace.
+
+```bash
+cd /opt/remnawave/nginx && docker compose down
+cd /opt/remnawave       && docker compose down
+```
+
+### 🧟‍♀️ Reanimation (Restart)
+
+```bash
+cd /opt/remnawave && docker compose restart
+```
+
+*👻 If you only tweaked `nginx.conf`, don't disturb the corpse, just hot-reload:*
+```bash
+docker exec remnawave-nginx nginx -s reload
+```
+
+### 👁️ Peeping (Status / Logs)
+
+```bash
+docker ps
+cd /opt/remnawave && docker compose logs -f remnawave
+docker logs -f remnawave-nginx
+```
+
+> 🕸️ Don't fear power outages. Every container is carved with the `restart: always` resurrection rune. As long as the server gets power, they will automatically crawl out of their graves to find you. 🦇
