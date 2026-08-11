@@ -3,17 +3,21 @@
 # ============================================================
 # Remnawave 面板 + Nginx 反代 + Let's Encrypt 证书
 # 目标环境：AWS EC2 / Ubuntu / Debian
-# 最终用途：面板 + VPN 节点（节点走 TLS，与面板共用 443）
+#
+# 本脚本只装面板。节点（remnanode）在面板装好后，
+# 登录面板 Nodes -> Management 里创建，节点地址/端口/SNI 都在面板 UI 填。
+# 节点若要和面板挤同一台机器共用 443，回来在 nginx.conf 的
+# sni_target 映射里加一行即可（文件里已留好带注释的位置）。
 #
 # 端口架构
 #   公网 :80  -> Nginx HTTP：ACME HTTP-01 校验 + 301 跳转
 #   公网 :443 -> Nginx stream 层，ssl_preread 按 ALPN/SNI 分流
 #                ├─ ALPN=acme-tls/1  -> 容器 :18443 -> 宿主机 :8443 (acme.sh)
 #                ├─ SNI=面板/订阅域名 -> 容器 :9443 -> remnawave:3000
-#                └─ SNI=节点域名      -> 预留给 Xray / remnanode
+#                └─ 其它 SNI          -> 拒绝握手（节点位预留在此）
 #
 #   Let's Encrypt 的 TLS-ALPN-01 只连 443，所以由 stream 层按 ALPN
-#   把校验流量转到 8443。节点同样占 443，靠 SNI 与面板分开。
+#   把校验流量转到 8443。同机节点同样占 443，靠 SNI 与面板分开。
 #
 # AWS 安全组：TCP 80、443 必开；8443 建议开（便于排查）。
 # 3000 / 3001 / 6767 只绑 127.0.0.1，不对外。
@@ -116,13 +120,6 @@ if [ -z "${SUB_DOMAIN}" ]; then
 fi
 
 echo
-echo "节点域名 Node domain（可选，做 VPN 节点用）"
-echo "  节点与面板【同一台机器】且该域名【已解析到本机】才填。"
-echo "  填了会一并签进证书，节点可直接复用同一套证书做 TLS。"
-echo "  节点在另一台机器 / 用 Reality 免证书 -> 直接回车跳过。"
-read -rp "节点域名: " NODE_DOMAIN
-
-echo
 read -rp "SSL 邮箱 (必填): " EMAIL
 
 if [ -z "${EMAIL}" ]; then
@@ -159,28 +156,13 @@ if ! validate_domain "${SUB_DOMAIN}"; then
     exit 1
 fi
 
-if [ -n "${NODE_DOMAIN}" ] && ! validate_domain "${NODE_DOMAIN}"; then
-    echo "ERROR: 节点域名不合法: ${NODE_DOMAIN}"
-    exit 1
-fi
-
-# WEB_DOMAINS : 走面板 HTTPS 的域名，用于 server_name 与 SNI 映射
-# DOMAIN_LIST : 需要签进证书的全部域名
-# 同名域名只保留一份，避免 nginx server_name 冲突和 acme.sh 重复 -d
-WEB_DOMAINS=("${MAIN_DOMAIN}")
+# DOMAIN_LIST：面板 HTTPS 的域名，同时也是要签进证书的域名。
+# 同名只保留一份，避免 nginx server_name 冲突和 acme.sh 重复 -d
+DOMAIN_LIST=("${MAIN_DOMAIN}")
 SAME_DOMAIN="yes"
 if [ "${SUB_DOMAIN}" != "${MAIN_DOMAIN}" ]; then
-    WEB_DOMAINS+=("${SUB_DOMAIN}")
+    DOMAIN_LIST+=("${SUB_DOMAIN}")
     SAME_DOMAIN="no"
-fi
-
-DOMAIN_LIST=("${WEB_DOMAINS[@]}")
-HAS_NODE="no"
-if [ -n "${NODE_DOMAIN}" ] \
-   && [ "${NODE_DOMAIN}" != "${MAIN_DOMAIN}" ] \
-   && [ "${NODE_DOMAIN}" != "${SUB_DOMAIN}" ]; then
-    DOMAIN_LIST+=("${NODE_DOMAIN}")
-    HAS_NODE="yes"
 fi
 
 echo
@@ -190,11 +172,6 @@ if [ "${SAME_DOMAIN}" = "yes" ]; then
     echo "订阅域名 : ${SUB_DOMAIN}  (与面板同域名)"
 else
     echo "订阅域名 : ${SUB_DOMAIN}"
-fi
-if [ "${HAS_NODE}" = "yes" ]; then
-    echo "节点域名 : ${NODE_DOMAIN}  (签入证书 + 预留 SNI 分流位)"
-else
-    echo "节点域名 : 未配置"
 fi
 echo "订阅地址 : https://${SUB_DOMAIN}/api/sub"
 echo "SSL 邮箱 : ${EMAIL}"
@@ -932,26 +909,25 @@ chmod 644 "${CERT_DIR}/privkey.key" "${CERT_DIR}/fullchain.pem"
 echo
 echo ">>> 生成 Nginx 配置（含 SNI 分流）..."
 
-SERVER_NAMES="${WEB_DOMAINS[*]}"
+SERVER_NAMES="${DOMAIN_LIST[*]}"
 
 # stream 层的 SNI 映射：面板 / 订阅域名 -> 容器内 HTTPS
 SNI_MAP_ENTRIES=""
-for d in "${WEB_DOMAINS[@]}"; do
+for d in "${DOMAIN_LIST[@]}"; do
     SNI_MAP_ENTRIES+="        ${d}  127.0.0.1:${INTERNAL_HTTPS_PORT};
 "
 done
 
-# 节点域名占位。Xray 装好前这条指向面板的 default_server，
-# 该域名的 TLS 握手会被拒绝，不会暴露面板。
-if [ "${HAS_NODE}" = "yes" ]; then
-    SNI_MAP_ENTRIES+="
-        # 节点域名占位。装好 remnanode / Xray 后把目标改成 Xray 的监听地址，例如
-        #     ${NODE_DOMAIN}  172.17.0.1:8444;
-        # 并在 Xray 入站开启 \"acceptProxyProtocol\": true。
-        # 改之前该域名的 TLS 握手会被拒绝。
-        ${NODE_DOMAIN}  127.0.0.1:${INTERNAL_HTTPS_PORT};
+# 同机节点的位置：面板里创建好节点后，来这里加一行把它的域名指向 Xray
+SNI_MAP_ENTRIES+="
+        # ---- 同机节点在此加行 ----
+        # 面板 Nodes -> Management 建好节点、Hosts 里定好客户端用的域名后，
+        # 把该域名解析到本机，然后在这里加一行指向 Xray 的监听地址，例如：
+        #     n1.example.com  172.17.0.1:8444;
+        # remnanode 若接入了 ${NETWORK_NAME}，直接写 容器名:端口。
+        # Xray 入站需开 \"acceptProxyProtocol\": true。
+        # 走 TLS（非 Reality）还要把该域名签进证书，命令见安装结束时的输出。
 "
-fi
 
 # 用 cat > 原地覆盖以保持 inode 不变，容器里的 bind mount 才能看到新内容。
 # 不要用 mv 或 sed -i。
@@ -1565,30 +1541,38 @@ echo "============================================================"
 echo "              🛰️  接入 VPN 节点"
 echo "============================================================"
 echo
-echo "证书路径（节点可直接复用）:"
-echo "    宿主机: ${CERT_DIR}/fullchain.pem"
-echo "            ${CERT_DIR}/privkey.key"
-echo "    后端容器内: /var/lib/remnawave/configs/xray/ssl/"
+echo "节点不在本脚本里配置，全部在面板 UI 完成："
+echo "    1) 浏览器打开 https://${MAIN_DOMAIN} 创建管理员账号"
+echo "    2) Nodes -> Management -> Create new node"
+echo "       填 Country / Internal name / Address / Port(默认 2222)"
+echo "    3) 面板会生成一段 docker-compose.yml，拷到节点服务器上："
+echo "         mkdir -p /opt/remnanode && cd /opt/remnanode"
+echo "         nano docker-compose.yml   # 粘贴面板给的内容"
+echo "         docker compose up -d"
+echo "    4) 回面板点 Create 完成，并选一个 Config Profile"
+echo "    5) Hosts 里新建 Host，Address 填客户端要连的域名，"
+echo "       需要时用 SNI 覆盖 serverNames —— 这里才是「节点域名」"
 echo
-echo "【A】节点在另一台机器"
-echo "    面板里直接添加节点，本机不用改。那台机器自己独占 443。"
+echo "  Address 里的域名解析到节点服务器的 IP，与本机面板域名无关。"
+echo "  NODE_PORT(2222) 只在面板和节点之间用，防火墙上只放行面板 IP。"
 echo
-echo "【B】节点和面板同一台机器，共用 443"
-echo "    1) 节点域名 A 记录指向 ${PUBLIC_IP:-本机公网IP}"
-echo "    2) 把节点域名签进证书:"
+echo "【节点在另一台机器】本机不用做任何改动。"
+echo
+echo "【节点和面板同一台机器，共用 443】还需要三步："
+echo "    a) 把节点域名解析到 ${PUBLIC_IP:-本机公网IP}"
+echo "    b) 走 TLS（非 Reality）时把它签进证书："
 echo "         ${ACME_SH} --issue -d ${MAIN_DOMAIN} -d <节点域名> \\"
 echo "           --alpn --tlsport ${ACME_TLS_PORT} --server letsencrypt"
-echo "       节点域名在 nginx.conf 里已有占位，Xray 装好前访问它会被拒绝握手。"
-echo "    3) 部署 remnanode，Xray 监听 127.0.0.1 的某个端口（如 8444），"
-echo "       入站 streamSettings.sockopt 设置 \"acceptProxyProtocol\": true"
-echo "    4) 编辑 ${NGINX_DIR}/nginx.conf，在 stream 的 sni_target 里加一行:"
+echo "         证书路径 ${CERT_DIR}/  后端容器内 /var/lib/remnawave/configs/xray/ssl/"
+echo "         Reality(self-steal) 不需要证书，跳过这步"
+echo "    c) 编辑 ${NGINX_DIR}/nginx.conf，在 stream 的 sni_target"
+echo "       「同机节点在此加行」处加一行，然后 reload："
 echo "         <节点域名>  172.17.0.1:8444;"
-echo "       remnanode 若在 ${NETWORK_NAME} 里则直接写容器名:端口"
-echo "    5) docker exec remnawave-nginx nginx -t && \\"
-echo "       docker exec remnawave-nginx nginx -s reload"
+echo "         docker exec remnawave-nginx nginx -t && \\"
+echo "         docker exec remnawave-nginx nginx -s reload"
+echo "       Xray 入站要开 \"acceptProxyProtocol\": true（stream 层带 PROXY 头）"
 echo
-echo "【C】Reality（self-steal，不需要证书）"
-echo "    同 B 的第 3~5 步，把节点域名的 SNI 指向 Xray。"
+echo "  加这一行之前，除面板域名外的所有 SNI 都会被拒绝握手。"
 
 echo
 echo "============================================================"
