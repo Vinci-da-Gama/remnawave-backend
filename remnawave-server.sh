@@ -4,33 +4,19 @@
 # Remnawave + Nginx + SSL
 # Ubuntu / Debian / AWS EC2
 #
-# Panel:
-#   https://aa.dropmint.cc.cd
-#
-# Subscription:
-#   https://sub.dropmint.cc.cd/api/sub
+# Requirements:
+#   - Panel domain is REQUIRED.
+#   - Subscription domain is OPTIONAL; blank means disabled.
+#   - AWS Security Group: TCP 80, 443, 8443.
 #
 # Architecture:
-#
-# Internet
-#    |
-#    | 80 / 443
-#    v
-# Nginx
-#    |
-#    | Docker network: remnawave-network
-#    v
-# Remnawave :3000
-#    |
-#    +--> PostgreSQL
-#    |
-#    +--> Valkey
-#
-# SSL:
-#   acme.sh + ALPN + TCP 8443
+#   Internet -> Nginx :80/:443 -> Remnawave :3000
+#   Remnawave -> PostgreSQL + Valkey
 #
 # IMPORTANT:
-#   Do NOT expose Remnawave 3000/3001 publicly.
+#   - Remnawave 3000/3001 are bound to localhost only.
+#   - The Docker network is explicitly external/shared.
+#   - No ${NGINX_DIR} interpolation is used in docker-compose.yml.
 # ============================================================
 
 set -Eeuo pipefail
@@ -38,6 +24,33 @@ set -Eeuo pipefail
 INSTALL_DIR="/opt/remnawave"
 NGINX_DIR="${INSTALL_DIR}/nginx"
 NETWORK_NAME="remnawave-network"
+
+# ------------------------------------------------------------
+# Graceful Ctrl+C / termination
+# ------------------------------------------------------------
+stopped_by_user() {
+    echo
+    echo "process will be stopped."
+    exit 130
+}
+trap stopped_by_user INT TERM
+
+# ------------------------------------------------------------
+# Error handler
+# ------------------------------------------------------------
+on_error() {
+    local line="${1:-unknown}"
+    echo
+    echo "ERROR: installation failed at line ${line}."
+    echo
+    echo "Useful diagnostics:"
+    echo "  cd ${INSTALL_DIR} 2>/dev/null && docker compose ps"
+    echo "  cd ${INSTALL_DIR} 2>/dev/null && docker compose logs --tail=100"
+    echo "  cd ${NGINX_DIR} 2>/dev/null && docker compose ps"
+    echo "  cd ${NGINX_DIR} 2>/dev/null && docker compose logs --tail=100"
+    exit 1
+}
+trap 'on_error $LINENO' ERR
 
 echo
 echo "============================================================"
@@ -51,8 +64,7 @@ echo
 
 if [ "${EUID}" -ne 0 ]; then
     echo "ERROR: Please run as root."
-    echo
-    echo "sudo bash $0"
+    echo "Use: sudo bash $0"
     exit 1
 fi
 
@@ -68,8 +80,7 @@ fi
 . /etc/os-release
 
 case "${ID:-}" in
-    ubuntu|debian)
-        ;;
+    ubuntu|debian) ;;
     *)
         echo "ERROR: This script supports Ubuntu/Debian only."
         echo "Detected: ${PRETTY_NAME:-unknown}"
@@ -83,62 +94,76 @@ echo "OK: ${PRETTY_NAME:-$ID}"
 # 2. CONFIG
 # ============================================================
 
-read -rp "Panel domain [aa.dropmint.cc.cd]: " MAIN_DOMAIN
-MAIN_DOMAIN="${MAIN_DOMAIN:-aa.dropmint.cc.cd}"
+echo
+read -rp "Panel domain (REQUIRED): " MAIN_DOMAIN
 
-read -rp "Subscription domain [sub.dropmint.cc.cd]: " SUB_DOMAIN
-SUB_DOMAIN="${SUB_DOMAIN:-sub.dropmint.cc.cd}"
+if [ -z "${MAIN_DOMAIN}" ]; then
+    echo
+    echo "Panel domain is required."
+    echo "No panel domain was provided. Exiting gracefully."
+    exit 0
+fi
 
-read -rp "SSL email: " EMAIL
+read -rp "Subscription domain (OPTIONAL, press Enter to skip): " SUB_DOMAIN
+
+read -rp "SSL email (REQUIRED): " EMAIL
 
 if [ -z "${EMAIL}" ]; then
-    echo "ERROR: SSL email cannot be empty."
+    echo
+    echo "SSL email is required."
+    echo "No email was provided. Exiting gracefully."
+    exit 0
+fi
+
+# ============================================================
+# 3. DOMAIN VALIDATION
+# ============================================================
+
+validate_domain() {
+    local domain="$1"
+
+    if [[ "${domain}" == *"/"* ]] ||
+       [[ "${domain}" == *" "* ]] ||
+       [[ "${domain}" == *":"* ]] ||
+       [[ "${domain}" == http://* ]] ||
+       [[ "${domain}" == https://* ]]; then
+        return 1
+    fi
+
+    [[ "${domain}" == *.* ]]
+}
+
+if ! validate_domain "${MAIN_DOMAIN}"; then
+    echo "ERROR: Invalid panel domain: ${MAIN_DOMAIN}"
+    exit 1
+fi
+
+if [ -n "${SUB_DOMAIN}" ] && ! validate_domain "${SUB_DOMAIN}"; then
+    echo "ERROR: Invalid subscription domain: ${SUB_DOMAIN}"
     exit 1
 fi
 
 echo
 echo "------------------------------------------------------------"
 echo "Panel        : ${MAIN_DOMAIN}"
-echo "Subscription : ${SUB_DOMAIN}"
+if [ -n "${SUB_DOMAIN}" ]; then
+    echo "Subscription : ${SUB_DOMAIN}"
+else
+    echo "Subscription : disabled"
+fi
 echo "SSL email    : ${EMAIL}"
 echo "------------------------------------------------------------"
 echo
 
 # ============================================================
-# 3. BASIC VALIDATION
-# ============================================================
-
-if [[ "${MAIN_DOMAIN}" == *"/"* ]]; then
-    echo "ERROR: MAIN_DOMAIN must not contain /"
-    exit 1
-fi
-
-if [[ "${SUB_DOMAIN}" == *"/"* ]]; then
-    echo "ERROR: SUB_DOMAIN must not contain /"
-    exit 1
-fi
-
-if [[ "${MAIN_DOMAIN}" == "http://"* || "${MAIN_DOMAIN}" == "https://"* ]]; then
-    echo "ERROR: Domain must not contain http:// or https://"
-    exit 1
-fi
-
-if [[ "${SUB_DOMAIN}" == "http://"* || "${SUB_DOMAIN}" == "https://"* ]]; then
-    echo "ERROR: Domain must not contain http:// or https://"
-    exit 1
-fi
-
-# ============================================================
 # 4. DEPENDENCIES
 # ============================================================
 
-echo
 echo ">>> Installing dependencies..."
 
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -y
-
 apt-get install -y --no-install-recommends \
     curl \
     socat \
@@ -165,17 +190,12 @@ fi
 systemctl enable --now docker
 
 if ! docker compose version >/dev/null 2>&1; then
-    echo
     echo "ERROR: Docker Compose plugin is unavailable."
-    docker --version || true
     exit 1
 fi
 
-echo "Docker:"
-docker --version
-
-echo "Compose:"
-docker compose version
+echo "Docker : $(docker --version)"
+echo "Compose: $(docker compose version)"
 
 # ============================================================
 # 6. DNS CHECK
@@ -200,40 +220,33 @@ resolve_domain() {
 }
 
 resolve_domain "${MAIN_DOMAIN}"
-resolve_domain "${SUB_DOMAIN}"
+
+if [ -n "${SUB_DOMAIN}" ]; then
+    resolve_domain "${SUB_DOMAIN}"
+fi
 
 echo
 echo "IMPORTANT:"
-echo "Both domains must point to this EC2 public IPv4."
+echo "The panel domain must point to this EC2 public IPv4."
+if [ -n "${SUB_DOMAIN}" ]; then
+    echo "The subscription domain must also point to this EC2 public IPv4."
+fi
+
+# ============================================================
+# 7. PORT CHECK
+# ============================================================
+
 echo
-
-# ============================================================
-# 7. CHECK PORTS
-# ============================================================
-
 echo ">>> Checking local ports..."
 
-if ss -lnt 2>/dev/null | grep -qE '(^|:)443[[:space:]]'; then
-    echo "ERROR: TCP 443 is already occupied."
-    ss -lntp | grep ':443' || true
-    exit 1
-fi
-
-if ss -lnt 2>/dev/null | grep -qE '(^|:)80[[:space:]]'; then
-    echo "ERROR: TCP 80 is already occupied."
-    ss -lntp | grep ':80' || true
-    exit 1
-fi
-
-if ss -lnt 2>/dev/null | grep -qE '(^|:)8443[[:space:]]'; then
-    echo "ERROR: TCP 8443 is already occupied."
-    ss -lntp | grep ':8443' || true
-    exit 1
-fi
-
-echo "OK: 80 is free"
-echo "OK: 443 is free"
-echo "OK: 8443 is free"
+for port in 80 443 8443; do
+    if ss -lnt 2>/dev/null | grep -qE "([[:space:]:])${port}[[:space:]]"; then
+        echo "ERROR: TCP ${port} is already occupied."
+        ss -lntp | grep ":${port}" || true
+        exit 1
+    fi
+    echo "OK: ${port} is free"
+done
 
 # ============================================================
 # 8. PREPARE DIRECTORIES
@@ -244,28 +257,18 @@ echo ">>> Preparing ${INSTALL_DIR}..."
 
 mkdir -p "${INSTALL_DIR}"
 mkdir -p "${NGINX_DIR}"
-
 cd "${INSTALL_DIR}"
 
 # ============================================================
-# 9. DOWNLOAD OFFICIAL REMNAWAVE FILES
+# 9. DOWNLOAD OFFICIAL ENV SAMPLE
 # ============================================================
 
 echo
-echo ">>> Downloading official Remnawave files..."
-
-curl -fsSL \
-    -o "${INSTALL_DIR}/docker-compose.yml" \
-    "https://raw.githubusercontent.com/remnawave/backend/refs/heads/main/docker-compose-prod.yml"
+echo ">>> Downloading official Remnawave environment sample..."
 
 curl -fsSL \
     -o "${INSTALL_DIR}/.env" \
     "https://raw.githubusercontent.com/remnawave/backend/refs/heads/main/.env.sample"
-
-if [ ! -s "${INSTALL_DIR}/docker-compose.yml" ]; then
-    echo "ERROR: docker-compose.yml download failed."
-    exit 1
-fi
 
 if [ ! -s "${INSTALL_DIR}/.env" ]; then
     echo "ERROR: .env download failed."
@@ -274,39 +277,32 @@ fi
 
 # ============================================================
 # 10. DOCKER NETWORK
-#
-# IMPORTANT:
-# The network MUST exist BEFORE Remnawave is started.
-#
-# This fixes the original installer bug.
 # ============================================================
 
 echo
 echo ">>> Creating Docker network..."
 
 if docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1; then
-    echo "Docker network already exists: ${NETWORK_NAME}"
+    echo "OK: Docker network already exists."
 else
-    docker network create \
-        --driver bridge \
-        "${NETWORK_NAME}"
+    docker network create --driver bridge "${NETWORK_NAME}" >/dev/null
+    echo "OK: Docker network ${NETWORK_NAME}"
 fi
 
-echo "OK: Docker network ${NETWORK_NAME}"
-
 # ============================================================
-# 11. FORCE REMNAWAVE COMPOSE TO USE SAME NETWORK
+# 11. REMNAWAVE COMPOSE
 #
-# We intentionally generate our own compose file.
+# IMPORTANT:
+# There is deliberately NO ${NGINX_DIR} in this heredoc.
+# Docker Compose must not interpolate a host Bash variable.
 #
-# The network is external because Nginx is in another compose
-# project and MUST join exactly the same Docker network.
+# The host path is inserted literally by Bash below.
 # ============================================================
 
 echo
 echo ">>> Preparing Remnawave Docker Compose..."
 
-cat > "${INSTALL_DIR}/docker-compose.yml" <<'EOF'
+cat > "${INSTALL_DIR}/docker-compose.yml" <<EOF
 x-common: &common
   ulimits:
     nofile:
@@ -340,14 +336,14 @@ services:
       - ${NGINX_DIR}/:/var/lib/remnawave/configs/xray/ssl
 
     ports:
-      - "127.0.0.1:3000:${APP_PORT:-3000}"
-      - "127.0.0.1:3001:${METRICS_PORT:-3001}"
+      - "127.0.0.1:3000:\${APP_PORT:-3000}"
+      - "127.0.0.1:3001:\${METRICS_PORT:-3001}"
 
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "curl -f http://localhost:${METRICS_PORT:-3001}/health"
+          "curl -f http://localhost:\${METRICS_PORT:-3001}/health"
         ]
       interval: 30s
       timeout: 5s
@@ -370,9 +366,9 @@ services:
     <<: [*common, *logging, *env]
 
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: \${POSTGRES_USER}
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+      POSTGRES_DB: \${POSTGRES_DB}
       TZ: UTC
 
     ports:
@@ -385,11 +381,12 @@ services:
       test:
         [
           "CMD-SHELL",
-          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"
+          "pg_isready -U \$\${POSTGRES_USER} -d \$\${POSTGRES_DB}"
         ]
       interval: 3s
       timeout: 10s
-      retries: 5
+      retries: 10
+      start_period: 10s
 
   remnawave-redis:
     image: valkey/valkey:9-alpine
@@ -401,15 +398,22 @@ services:
     volumes:
       - valkey-socket:/var/run/valkey
 
-    command: >
-      valkey-server
-      --save ""
-      --appendonly no
-      --maxmemory-policy noeviction
-      --loglevel warning
-      --unixsocket /var/run/valkey/valkey.sock
-      --unixsocketperm 777
-      --port 0
+    command:
+      - valkey-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory-policy
+      - noeviction
+      - --loglevel
+      - warning
+      - --unixsocket
+      - /var/run/valkey/valkey.sock
+      - --unixsocketperm
+      - "777"
+      - --port
+      - "0"
 
     healthcheck:
       test:
@@ -422,16 +426,15 @@ services:
         ]
       interval: 3s
       timeout: 3s
-      retries: 5
+      retries: 10
+      start_period: 5s
 
 networks:
-
   remnawave-network:
     name: remnawave-network
     external: true
 
 volumes:
-
   remnawave-db-data:
     name: remnawave-db-data
     driver: local
@@ -444,7 +447,7 @@ volumes:
 EOF
 
 # ============================================================
-# 12. GENERATE SECRETS
+# 12. ENV HELPERS / SECRETS
 # ============================================================
 
 echo
@@ -473,7 +476,6 @@ POSTGRES_PASSWORD="$(openssl rand -hex 24)"
 set_env "JWT_AUTH_SECRET" "${JWT_AUTH_SECRET}"
 set_env "JWT_API_TOKENS_SECRET" "${JWT_API_TOKENS_SECRET}"
 
-# Compatibility with versions that still contain APP_SECRET.
 if grep -qE "^APP_SECRET=|^#APP_SECRET=" "${INSTALL_DIR}/.env"; then
     set_env "APP_SECRET" "${APP_SECRET}"
 fi
@@ -483,7 +485,7 @@ set_env "WEBHOOK_SECRET_HEADER" "${WEBHOOK_SECRET_HEADER}"
 set_env "POSTGRES_PASSWORD" "${POSTGRES_PASSWORD}"
 
 # ============================================================
-# 13. DATABASE URL
+# 13. DATABASE
 # ============================================================
 
 echo
@@ -492,40 +494,51 @@ echo ">>> Configuring PostgreSQL..."
 DATABASE_URL="postgresql://postgres:${POSTGRES_PASSWORD}@remnawave-db:5432/postgres"
 
 if grep -q '^DATABASE_URL=' "${INSTALL_DIR}/.env"; then
-    sed -i \
-        "s|^DATABASE_URL=.*|DATABASE_URL=\"${DATABASE_URL}\"|" \
-        "${INSTALL_DIR}/.env"
+    sed -i "s|^DATABASE_URL=.*|DATABASE_URL=\"${DATABASE_URL}\"|" "${INSTALL_DIR}/.env"
 else
     printf 'DATABASE_URL="%s"\n' "${DATABASE_URL}" >> "${INSTALL_DIR}/.env"
 fi
 
 # ============================================================
-# 14. DOMAIN CONFIG
+# 14. DOMAINS
 # ============================================================
 
 echo
 echo ">>> Configuring domains..."
 
 set_env "FRONT_END_DOMAIN" "${MAIN_DOMAIN}"
-set_env "SUB_PUBLIC_DOMAIN" "${SUB_DOMAIN}/api/sub"
 set_env "PANEL_DOMAIN" "${MAIN_DOMAIN}"
 
-echo
+if [ -n "${SUB_DOMAIN}" ]; then
+    set_env "SUB_PUBLIC_DOMAIN" "${SUB_DOMAIN}/api/sub"
+else
+    # Do not invent a subscription URL when the user skipped it.
+    if grep -qE '^SUB_PUBLIC_DOMAIN=' "${INSTALL_DIR}/.env"; then
+        sed -i 's|^SUB_PUBLIC_DOMAIN=.*|SUB_PUBLIC_DOMAIN=|' "${INSTALL_DIR}/.env"
+    elif grep -qE '^#SUB_PUBLIC_DOMAIN=' "${INSTALL_DIR}/.env"; then
+        sed -i 's|^#SUB_PUBLIC_DOMAIN=.*|SUB_PUBLIC_DOMAIN=|' "${INSTALL_DIR}/.env"
+    else
+        printf 'SUB_PUBLIC_DOMAIN=\n' >> "${INSTALL_DIR}/.env"
+    fi
+fi
+
 echo "FRONT_END_DOMAIN=${MAIN_DOMAIN}"
-echo "SUB_PUBLIC_DOMAIN=${SUB_DOMAIN}/api/sub"
+if [ -n "${SUB_DOMAIN}" ]; then
+    echo "SUB_PUBLIC_DOMAIN=${SUB_DOMAIN}/api/sub"
+else
+    echo "SUB_PUBLIC_DOMAIN=disabled"
+fi
 echo "PANEL_DOMAIN=${MAIN_DOMAIN}"
 
 # ============================================================
-# 15. VALIDATE COMPOSE BEFORE STARTING
+# 15. VALIDATE COMPOSE
 # ============================================================
 
 echo
 echo ">>> Validating Remnawave Compose..."
 
 cd "${INSTALL_DIR}"
-
 docker compose config >/dev/null
-
 echo "OK: docker-compose.yml"
 
 # ============================================================
@@ -538,25 +551,33 @@ echo ">>> Starting Remnawave..."
 docker compose up -d
 
 echo
-echo ">>> Waiting for Remnawave..."
+echo ">>> Waiting for PostgreSQL / Valkey / Remnawave..."
 
-for i in $(seq 1 60); do
+for i in $(seq 1 90); do
+    db_status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' remnawave-db 2>/dev/null || true)"
+    redis_status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' remnawave-redis 2>/dev/null || true)"
+    app_running="$(docker inspect -f '{{.State.Running}}' remnawave 2>/dev/null || true)"
 
-    if docker inspect \
-        -f '{{.State.Running}}' \
-        remnawave 2>/dev/null | grep -q true; then
-
-        echo "OK: remnawave container is running."
+    if [ "${db_status}" = "healthy" ] &&
+       [ "${redis_status}" = "healthy" ] &&
+       [ "${app_running}" = "true" ]; then
+        echo "OK: Remnawave stack is running."
         break
     fi
 
-    if [ "$i" -eq 60 ]; then
+    if [ "${db_status}" = "unhealthy" ]; then
         echo
-        echo "ERROR: Remnawave failed to start."
-        echo
+        echo "ERROR: PostgreSQL is unhealthy."
         docker compose ps
+        docker compose logs --tail=100 remnawave-db
+        exit 1
+    fi
+
+    if [ "$i" -eq 90 ]; then
         echo
-        docker compose logs --tail=100 remnawave
+        echo "ERROR: Remnawave stack did not become ready."
+        docker compose ps
+        docker compose logs --tail=100
         exit 1
     fi
 
@@ -564,44 +585,15 @@ for i in $(seq 1 60); do
 done
 
 # ============================================================
-# 17. VERIFY REMNAWAVE NETWORK
+# 17. VERIFY NETWORK
 # ============================================================
 
 echo
-echo ">>> Verifying Docker network..."
+echo ">>> Verifying Remnawave Docker network..."
 
 if ! docker network inspect "${NETWORK_NAME}" \
     | grep -q '"Name": "remnawave"'; then
-
-    echo "ERROR: remnawave is NOT connected to ${NETWORK_NAME}."
-
-    docker network inspect "${NETWORK_NAME}" || true
-
-    echo
-    echo "Trying to repair Docker network..."
-
-    docker compose down
-
-    docker network rm "${NETWORK_NAME}" >/dev/null 2>&1 || true
-
-    docker network create \
-        --driver bridge \
-        "${NETWORK_NAME}"
-
-    docker compose up -d
-
-    sleep 5
-
-fi
-
-# Final network check.
-
-if ! docker network inspect "${NETWORK_NAME}" \
-    | grep -q '"Name": "remnawave"'; then
-
-    echo
-    echo "ERROR: Remnawave still cannot join Docker network."
-    echo
+    echo "ERROR: remnawave is not connected to ${NETWORK_NAME}."
     docker network inspect "${NETWORK_NAME}" || true
     exit 1
 fi
@@ -609,28 +601,22 @@ fi
 echo "OK: remnawave is connected to ${NETWORK_NAME}"
 
 # ============================================================
-# 18. TEST REMNAWAVE INTERNAL API
+# 18. HEALTH CHECK
 # ============================================================
 
 echo
-echo ">>> Testing Remnawave localhost port..."
+echo ">>> Testing Remnawave health endpoint..."
 
-if ! curl -fsS \
-    --max-time 10 \
-    "http://127.0.0.1:3001/health" \
-    >/dev/null 2>&1; then
-
-    echo "WARNING: Remnawave health endpoint is not ready yet."
-
-    docker compose ps
-    docker compose logs --tail=50 remnawave
-
-else
+if curl -fsS --max-time 10 \
+    "http://127.0.0.1:3001/health" >/dev/null 2>&1; then
     echo "OK: Remnawave health endpoint is responding."
+else
+    echo "WARNING: Remnawave health endpoint is not ready."
+    docker compose ps
 fi
 
 # ============================================================
-# 19. INSTALL ACME.SH
+# 19. ACME.SH
 # ============================================================
 
 echo
@@ -639,9 +625,7 @@ echo ">>> Installing acme.sh..."
 export HOME="/root"
 
 if [ ! -x "${HOME}/.acme.sh/acme.sh" ]; then
-    curl -fsSL \
-        https://get.acme.sh \
-        | sh -s email="${EMAIL}"
+    curl -fsSL https://get.acme.sh | sh -s email="${EMAIL}"
 fi
 
 ACME_SH="${HOME}/.acme.sh/acme.sh"
@@ -651,15 +635,10 @@ if [ ! -x "${ACME_SH}" ]; then
     exit 1
 fi
 
-# Make sure cron exists for renewal.
 systemctl enable --now cron >/dev/null 2>&1 || true
 
 # ============================================================
-# 20. ISSUE SSL CERTIFICATE
-#
-# IMPORTANT:
-# Nginx is NOT started yet.
-# Therefore 8443 is available to acme.sh.
+# 20. ISSUE SSL
 # ============================================================
 
 echo
@@ -667,10 +646,11 @@ echo ">>> Issuing SSL certificate..."
 
 mkdir -p "${NGINX_DIR}"
 
-CERT_ARGS=(
-    -d "${MAIN_DOMAIN}"
-    -d "${SUB_DOMAIN}"
-)
+CERT_ARGS=(-d "${MAIN_DOMAIN}")
+
+if [ -n "${SUB_DOMAIN}" ]; then
+    CERT_ARGS+=(-d "${SUB_DOMAIN}")
+fi
 
 "${ACME_SH}" \
     --issue \
@@ -682,7 +662,7 @@ CERT_ARGS=(
 echo "OK: SSL certificate issued."
 
 # ============================================================
-# 21. INSTALL CERTIFICATE
+# 21. INSTALL SSL CERTIFICATE
 # ============================================================
 
 echo
@@ -704,32 +684,24 @@ chmod 644 "${NGINX_DIR}/fullchain.pem"
 echo
 echo ">>> Creating Nginx configuration..."
 
+SERVER_NAMES="${MAIN_DOMAIN}"
+if [ -n "${SUB_DOMAIN}" ]; then
+    SERVER_NAMES="${MAIN_DOMAIN} ${SUB_DOMAIN}"
+fi
+
 cat > "${NGINX_DIR}/nginx.conf" <<EOF
-
-# ============================================================
-# Remnawave upstream
-# ============================================================
-
 upstream remnawave {
     server remnawave:3000;
 }
-
-# ============================================================
-# HTTP -> HTTPS
-# ============================================================
 
 server {
     listen 80;
     listen [::]:80;
 
-    server_name ${MAIN_DOMAIN} ${SUB_DOMAIN};
+    server_name ${SERVER_NAMES};
 
     return 301 https://\$host\$request_uri;
 }
-
-# ============================================================
-# HTTPS
-# ============================================================
 
 server {
     listen 443 ssl reuseport;
@@ -737,22 +709,19 @@ server {
 
     http2 on;
 
-    server_name ${MAIN_DOMAIN} ${SUB_DOMAIN};
+    server_name ${SERVER_NAMES};
 
     ssl_certificate /etc/nginx/ssl/fullchain.pem;
     ssl_certificate_key /etc/nginx/ssl/privkey.key;
     ssl_trusted_certificate /etc/nginx/ssl/fullchain.pem;
 
     ssl_protocols TLSv1.2 TLSv1.3;
-
     ssl_session_timeout 1d;
     ssl_session_cache shared:MozSSL:10m;
     ssl_session_tickets off;
 
     location / {
-
         proxy_http_version 1.1;
-
         proxy_pass http://remnawave;
 
         proxy_set_header Host \$host;
@@ -769,15 +738,12 @@ server {
     gzip_vary on;
     gzip_proxied any;
     gzip_comp_level 6;
-    gzip_buffers 16 8k;
-    gzip_http_version 1.1;
     gzip_min_length 256;
 
     gzip_types
         application/atom+xml
         application/geo+json
         application/javascript
-        application/x-javascript
         application/json
         application/ld+json
         application/manifest+json
@@ -785,19 +751,12 @@ server {
         application/rss+xml
         application/xhtml+xml
         application/xml
-        font/eot
-        font/otf
-        font/ttf
         image/svg+xml
         text/css
         text/javascript
         text/plain
         text/xml;
 }
-
-# ============================================================
-# Reject unknown HTTPS hosts
-# ============================================================
 
 server {
     listen 443 ssl default_server;
@@ -807,11 +766,14 @@ server {
 
     ssl_reject_handshake on;
 }
-
 EOF
 
 # ============================================================
-# 23. NGINX DOCKER COMPOSE
+# 23. NGINX COMPOSE
+#
+# IMPORTANT:
+# No ${NGINX_DIR} appears here.
+# Relative bind mounts are resolved from NGINX_DIR by Compose.
 # ============================================================
 
 echo
@@ -819,15 +781,10 @@ echo ">>> Creating Nginx Docker Compose..."
 
 cat > "${NGINX_DIR}/docker-compose.yml" <<'EOF'
 services:
-
   remnawave-nginx:
-
     image: nginx:1.30
-
     container_name: remnawave-nginx
-
     hostname: remnawave-nginx
-
     restart: always
 
     security_opt:
@@ -852,15 +809,13 @@ services:
       - remnawave-network
 
 networks:
-
   remnawave-network:
     name: remnawave-network
-    driver: bridge
     external: true
 EOF
 
 # ============================================================
-# 24. NGINX CONFIG TEST BEFORE START
+# 24. NGINX TEST
 # ============================================================
 
 echo
@@ -868,30 +823,20 @@ echo ">>> Testing Nginx configuration..."
 
 cd "${NGINX_DIR}"
 
-docker compose run \
-    --rm \
-    --no-deps \
-    remnawave-nginx \
-    nginx -t
-
+docker compose run --rm --no-deps remnawave-nginx nginx -t
 echo "OK: Nginx configuration is valid."
 
 # ============================================================
-# 25. VERIFY NGINX CAN RESOLVE REMNAWAVE
-#
-# This is the exact problem that broke the previous install.
+# 25. DOCKER DNS TEST
 # ============================================================
 
 echo
-echo ">>> Testing Docker DNS: remnawave -> remnawave..."
+echo ">>> Testing Docker DNS: Nginx -> Remnawave..."
 
-docker compose run \
-    --rm \
-    --no-deps \
-    remnawave-nginx \
+docker compose run --rm --no-deps remnawave-nginx \
     getent hosts remnawave
 
-echo "OK: Docker DNS can resolve remnawave."
+echo "OK: Docker DNS resolves remnawave."
 
 # ============================================================
 # 26. START NGINX
@@ -901,7 +846,6 @@ echo
 echo ">>> Starting Nginx..."
 
 docker compose up -d
-
 sleep 5
 
 if ! docker inspect \
@@ -910,9 +854,7 @@ if ! docker inspect \
 
     echo
     echo "ERROR: Nginx failed to start."
-    echo
     docker compose ps
-    echo
     docker compose logs --tail=100
     exit 1
 fi
@@ -920,50 +862,39 @@ fi
 echo "OK: Nginx is running."
 
 # ============================================================
-# 27. VERIFY BOTH CONTAINERS ARE ON SAME NETWORK
+# 27. FINAL NETWORK CHECK
 # ============================================================
 
 echo
 echo ">>> Verifying final Docker network..."
 
-docker network inspect "${NETWORK_NAME}" \
-    | grep -E '"Name": "(remnawave|remnawave-nginx)"' \
-    || true
-
 if ! docker network inspect "${NETWORK_NAME}" \
     | grep -q '"Name": "remnawave"'; then
-
-    echo "ERROR: remnawave is missing from network."
+    echo "ERROR: remnawave is missing from ${NETWORK_NAME}."
     exit 1
 fi
 
 if ! docker network inspect "${NETWORK_NAME}" \
     | grep -q '"Name": "remnawave-nginx"'; then
-
-    echo "ERROR: remnawave-nginx is missing from network."
+    echo "ERROR: remnawave-nginx is missing from ${NETWORK_NAME}."
     exit 1
 fi
 
-echo
 echo "OK: Both containers share ${NETWORK_NAME}"
 
 # ============================================================
-# 28. TEST NGINX -> REMNAWAVE
+# 28. NGINX -> REMNAWAVE TEST
 # ============================================================
 
 echo
 echo ">>> Testing Nginx -> Remnawave connectivity..."
 
 docker exec remnawave-nginx \
-    wget \
-    -q \
-    -O /dev/null \
-    --timeout=10 \
+    wget -q -O /dev/null --timeout=10 \
     "http://remnawave:3000/" \
     || {
-
         echo
-        echo "WARNING: Nginx container cannot currently reach Remnawave."
+        echo "ERROR: Nginx cannot reach Remnawave."
         echo
         docker logs --tail=50 remnawave
         echo
@@ -974,7 +905,7 @@ docker exec remnawave-nginx \
 echo "OK: Nginx can reach Remnawave."
 
 # ============================================================
-# 29. SSL RENEWAL
+# 29. AUTO RENEWAL
 # ============================================================
 
 echo
@@ -996,21 +927,13 @@ echo "OK: Automatic SSL renewal configured."
 echo
 echo ">>> Testing HTTPS locally..."
 
-if curl \
-    -k \
-    -fsSI \
-    --max-time 15 \
+if curl -k -fsSI --max-time 15 \
     --resolve "${MAIN_DOMAIN}:443:127.0.0.1" \
-    "https://${MAIN_DOMAIN}/" \
-    >/dev/null; then
-
+    "https://${MAIN_DOMAIN}/" >/dev/null; then
     echo "OK: Local HTTPS is working."
-
 else
-
     echo
     echo "ERROR: Local HTTPS test failed."
-    echo
     docker compose logs --tail=100
     exit 1
 fi
@@ -1022,17 +945,11 @@ fi
 echo
 echo ">>> Testing HTTP -> HTTPS redirect..."
 
-if curl \
-    -fsSI \
-    --max-time 15 \
+if curl -fsSI --max-time 15 \
     --resolve "${MAIN_DOMAIN}:80:127.0.0.1" \
-    "http://${MAIN_DOMAIN}/" \
-    | grep -qi "301\|302"; then
-
+    "http://${MAIN_DOMAIN}/" | grep -qiE "301|302"; then
     echo "OK: HTTP redirects to HTTPS."
-
 else
-
     echo "WARNING: HTTP redirect test did not return 301/302."
 fi
 
@@ -1042,53 +959,81 @@ fi
 
 echo
 echo "============================================================"
-echo "                    INSTALLATION COMPLETE"
+echo "              INSTALLATION COMPLETE"
 echo "============================================================"
 echo
 
-echo "Panel:"
-echo "  https://${MAIN_DOMAIN}"
+echo "🎛️  Panel:"
+echo "    https://${MAIN_DOMAIN}"
+
+if [ -n "${SUB_DOMAIN}" ]; then
+    echo
+    echo "💌 Subscription:"
+    echo "    https://${SUB_DOMAIN}/api/sub"
+fi
 
 echo
-echo "Subscription:"
-echo "  https://${SUB_DOMAIN}/api/sub"
-
-echo
-echo "Docker:"
+echo "🐳 Docker:"
 docker ps \
     --filter name=remnawave \
     --filter name=remnawave-nginx \
     --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
 echo
-echo "Docker network:"
+echo "🌐 Docker network:"
 docker network inspect "${NETWORK_NAME}" \
     --format '{{range .Containers}}{{.Name}} -> {{.IPv4Address}}{{println}}{{end}}'
 
 echo
-echo "Listening ports:"
-ss -lntp | grep -E ':(80|443)\s' || true
+echo "🔌 Listening ports:"
+ss -lntp | grep -E ':(80|443)[[:space:]]' || true
 
 echo
 echo "============================================================"
-echo " IMPORTANT"
+echo "                 📚 COMMON COMMANDS"
 echo "============================================================"
 echo
-echo "AWS Security Group must allow:"
+
+echo "🎛️  Remnawave:"
+echo "    cd ${INSTALL_DIR} && docker compose ps"
+echo "    cd ${INSTALL_DIR} && docker compose logs -f remnawave"
+echo "    cd ${INSTALL_DIR} && docker compose restart"
+echo "    cd ${INSTALL_DIR} && docker compose down"
+echo "    cd ${INSTALL_DIR} && docker compose up -d"
+
 echo
-echo "  TCP 80"
-echo "  TCP 443"
-echo "  TCP 8443"
+echo "🪽 Nginx:"
+echo "    cd ${NGINX_DIR} && docker compose ps"
+echo "    cd ${NGINX_DIR} && docker compose logs -f"
+echo "    cd ${NGINX_DIR} && docker compose restart"
+echo "    cd ${NGINX_DIR} && docker compose down"
+echo "    cd ${NGINX_DIR} && docker compose up -d"
+
 echo
-echo "Remnawave 3000/3001 are bound to 127.0.0.1 only."
+echo "🩺 Health:"
+echo "    curl -fsS http://127.0.0.1:3001/health"
+echo "    docker ps"
+echo "    docker network inspect ${NETWORK_NAME}"
+
 echo
-echo "Open:"
+echo "🔐 SSL:"
+echo "    ${ACME_SH} --list"
+echo "    ${ACME_SH} --renew-all"
+
 echo
-echo "  https://${MAIN_DOMAIN}"
+echo "🌍 HTTPS:"
+echo "    curl -I https://${MAIN_DOMAIN}"
+
 echo
-echo "Do NOT use:"
-echo "  http://127.0.0.1:3000"
-echo "  http://${MAIN_DOMAIN}:3000"
+echo "⚙️  After changing .env:"
+echo "    cd ${INSTALL_DIR} && docker compose down && docker compose up -d"
+
 echo
+echo "🗑️  FULL UNINSTALL:"
+echo "    cd ${INSTALL_DIR} 2>/dev/null || true && docker compose down -v --remove-orphans 2>/dev/null || true && cd ${NGINX_DIR} 2>/dev/null || true && docker compose down -v --remove-orphans 2>/dev/null || true && docker rm -f remnawave remnawave-db remnawave-redis remnawave-nginx 2>/dev/null || true && docker volume rm remnawave-db-data valkey-socket 2>/dev/null || true && docker network rm ${NETWORK_NAME} 2>/dev/null || true && rm -rf ${INSTALL_DIR}"
+
+echo
+echo "============================================================"
+echo "                    ❤️  Ready"
 echo "============================================================"
 echo
