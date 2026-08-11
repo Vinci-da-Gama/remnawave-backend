@@ -1,0 +1,95 @@
+{
+    "log": {
+        "loglevel": "warning"
+    },
+    "inbounds": [
+        {
+            "tag": "VLESS_WS_TLS",
+            "listen": "0.0.0.0",
+            "port": 8333,
+            "protocol": "vless",
+            "settings": {
+                "clients": [],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "ws",
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": "<<<必改1/REPLACE1>>> 节点域名/your node domain, e.g. n1.example.com",
+                    "alpn": [
+                        "http/1.1"
+                    ],
+                    "certificates": [
+                        {
+                            "keyFile": "/var/lib/remnawave/configs/xray/ssl/privkey.key",
+                            "certificateFile": "/var/lib/remnawave/configs/xray/ssl/fullchain.pem"
+                        }
+                    ]
+                },
+                "wsSettings": {
+                    "host": "<<<必改2/REPLACE2>>> 同必改1的域名/same domain as REPLACE1",
+                    "path": "/vless-ws"
+                }
+            }
+        },
+        {
+            "tag": "VLESS_REALITY",
+            "listen": "0.0.0.0",
+            "port": 7443,
+            "protocol": "vless",
+            "settings": {
+                "clients": [],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "raw",
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "xver": 0,
+                    "target": "<<<必改3/REPLACE3>>> 偷用站点带端口/steal site with port, e.g. www.microsoft.com:443",
+                    "serverNames": [
+                        "<<<必改4/REPLACE4>>> 同必改3但不带端口/same as REPLACE3 without port, e.g. www.microsoft.com"
+                    ],
+                    "privateKey": "<<<必改5/REPLACE5>>> Reality私钥,面板生成/Reality private key, generate in panel",
+                    "shortIds": [
+                        "<<<必改6/REPLACE6>>> 16位十六进制/16 hex chars, run: openssl rand -hex 8"
+                    ]
+                }
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "tag": "DIRECT",
+            "protocol": "freedom"
+        },
+        {
+            "tag": "BLOCK",
+            "protocol": "blackhole"
+        }
+    ],
+    "routing": {
+        "rules": [
+            {
+                "ip": [
+                    "geoip:private"
+                ],
+                "outboundTag": "BLOCK"
+            },
+            {
+                "domain": [
+                    "geosite:private"
+                ],
+                "outboundTag": "BLOCK"
+            },
+            {
+                "protocol": [
+                    "bittorrent"
+                ],
+                "outboundTag": "BLOCK"
+            }
+        ]
+    }
+}
