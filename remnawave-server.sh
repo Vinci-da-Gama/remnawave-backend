@@ -62,6 +62,38 @@ on_error() {
 }
 trap 'on_error $LINENO' ERR
 
+# ------------------------------------------------------------
+# 字符串匹配辅助函数
+#
+# 全脚本不使用 `命令 | grep -q` 做判断：
+# grep -q 命中后立即退出并关闭管道，上游命令若还在写就会收到
+# SIGPIPE 而以 141 退出，set -o pipefail 会把整条管道判为失败，
+# 于是明明匹配上了却走进错误分支。改成先取到字符串再用 bash 匹配。
+# ------------------------------------------------------------
+
+# 字符串 $1 是否包含子串 $2
+str_has() {
+    [[ "$1" == *"$2"* ]]
+}
+
+# 多行字符串 $1 里是否有一整行等于 $2
+has_line() {
+    [[ $'\n'"$1"$'\n' == *$'\n'"$2"$'\n'* ]]
+}
+
+# 空格分隔的列表 $1 里是否含有词 $2
+has_word() {
+    [[ " $1 " == *" $2 "* ]]
+}
+
+# 容器 $1 是否已接入 ${NETWORK_NAME}
+container_in_network() {
+    local members
+    members="$(docker network inspect "${NETWORK_NAME}" \
+        --format '{{range .Containers}}{{println .Name}}{{end}}' 2>/dev/null || true)"
+    has_line "${members}" "$1"
+}
+
 echo
 echo "============================================================"
 echo "     Remnawave + Nginx(SNI 分流) + SSL Installer"
@@ -194,14 +226,19 @@ if [ -d "${INSTALL_DIR}" ]; then
 fi
 
 if command -v docker >/dev/null 2>&1; then
-    if docker ps -a --format '{{.Names}}' 2>/dev/null \
-        | grep -qE '^(remnawave|remnawave-db|remnawave-redis|remnawave-nginx)$'; then
-        FOUND_OLD="yes"
-    fi
-    if docker volume ls --format '{{.Name}}' 2>/dev/null \
-        | grep -qE '^(remnawave-db-data|valkey-socket)$'; then
-        FOUND_OLD="yes"
-    fi
+    OLD_CONTAINERS="$(docker ps -a --format '{{.Names}}' 2>/dev/null || true)"
+    for c in remnawave remnawave-db remnawave-redis remnawave-nginx; do
+        if has_line "${OLD_CONTAINERS}" "${c}"; then
+            FOUND_OLD="yes"
+        fi
+    done
+
+    OLD_VOLUMES="$(docker volume ls --format '{{.Name}}' 2>/dev/null || true)"
+    for v in remnawave-db-data valkey-socket; do
+        if has_line "${OLD_VOLUMES}" "${v}"; then
+            FOUND_OLD="yes"
+        fi
+    done
 fi
 
 if [ "${FOUND_OLD}" = "yes" ]; then
@@ -371,7 +408,7 @@ for d in "${DOMAIN_LIST[@]}"; do
     echo "  解析结果: ${RESOLVED}"
 
     if [ -n "${PUBLIC_IP}" ]; then
-        if printf '%s' "${RESOLVED}" | grep -qw "${PUBLIC_IP}"; then
+        if has_word "${RESOLVED}" "${PUBLIC_IP}"; then
             echo "  OK: 已指向本机公网 IP"
         else
             echo "  WARNING: 未指向本机公网 IP (${PUBLIC_IP})"
@@ -405,7 +442,9 @@ echo
 echo ">>> 检查本机端口占用..."
 
 port_in_use() {
-    ss -H -lnt "sport = :$1" 2>/dev/null | grep -q .
+    local out
+    out="$(ss -H -lnt "sport = :$1" 2>/dev/null || true)"
+    [ -n "${out}" ]
 }
 
 for port in 80 443 "${ACME_TLS_PORT}" 6767; do
@@ -730,7 +769,7 @@ check_env_value() {
         return
     fi
 
-    if ! printf '%s' "${actual}" | grep -qE "${pattern}"; then
+    if ! [[ "${actual}" =~ ${pattern} ]]; then
         echo "  ERROR: ${key} 取值异常: ${actual}"
         ENV_OK="no"
         return
@@ -868,7 +907,7 @@ fi
 
 echo "OK: Remnawave 后端已就绪（/health 正常）。"
 
-if ! docker network inspect "${NETWORK_NAME}" | grep -q '"Name": "remnawave"'; then
+if ! container_in_network remnawave; then
     echo "ERROR: remnawave 未接入 ${NETWORK_NAME}。"
     docker network inspect "${NETWORK_NAME}" || true
     exit 1
@@ -1204,7 +1243,9 @@ EOF
 echo
 echo ">>> 检查 Nginx 镜像的 stream_ssl_preread 模块 ..."
 
-if ! docker run --rm "${NGINX_IMAGE}" nginx -V 2>&1 | grep -q 'stream_ssl_preread'; then
+NGINX_BUILD_INFO="$(docker run --rm "${NGINX_IMAGE}" nginx -V 2>&1 || true)"
+
+if ! str_has "${NGINX_BUILD_INFO}" 'stream_ssl_preread'; then
     echo "ERROR: ${NGINX_IMAGE} 缺少 ngx_stream_ssl_preread_module，无法做 SNI 分流。"
     exit 1
 fi
@@ -1376,23 +1417,25 @@ fi
 
 chmod 644 "${CERT_DIR}/privkey.key" "${CERT_DIR}/fullchain.pem"
 
-# 确认装上的是 CA 签发的证书，不是引导用的自签证书
 CERT_ISSUER="$(openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -issuer 2>/dev/null || true)"
+CERT_SUBJECT="$(openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -subject 2>/dev/null || true)"
 CERT_DATES="$(openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -dates 2>/dev/null || true)"
-CERT_SANS="$(openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -ext subjectAltName 2>/dev/null | tail -n +2 | tr -d ' ' || true)"
+CERT_SANS="$(openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -ext subjectAltName 2>/dev/null | tail -n +2 | tr -d ' \n' || true)"
 
 echo "签发者: ${CERT_ISSUER}"
 echo "有效期: ${CERT_DATES}"
 echo "覆盖域名: ${CERT_SANS}"
 
-if printf '%s' "${CERT_ISSUER}" | grep -qi "CN=${MAIN_DOMAIN}"; then
+# 自签证书的 issuer 与 subject 相同，据此判断正式证书是否装上。
+# 不比对 "CN=域名" 字样：不同 OpenSSL 版本打印成 CN=x 或 CN = x，不可靠。
+if [ "${CERT_ISSUER#issuer=}" = "${CERT_SUBJECT#subject=}" ]; then
     echo "ERROR: 当前仍是自签名引导证书，正式证书没有装上。"
     exit 1
 fi
 
-# 逐个确认域名都在证书 SAN 里
+# 逐个确认域名都在证书 SAN 里（CERT_SANS 形如 DNS:a.com,DNS:b.com）
 for d in "${DOMAIN_LIST[@]}"; do
-    if printf '%s' "${CERT_SANS}" | grep -q "DNS:${d}\(,\|$\)"; then
+    if str_has ",${CERT_SANS}," ",DNS:${d},"; then
         echo "  OK: ${d} 已在证书内"
     else
         echo "  WARNING: ${d} 不在证书 SAN 内"
@@ -1417,15 +1460,13 @@ echo "OK: Docker DNS 解析正常。"
 echo
 echo ">>> 校验两个容器在同一网络 ..."
 
-if ! docker network inspect "${NETWORK_NAME}" | grep -q '"Name": "remnawave"'; then
-    echo "ERROR: ${NETWORK_NAME} 中缺少 remnawave。"
-    exit 1
-fi
-
-if ! docker network inspect "${NETWORK_NAME}" | grep -q '"Name": "remnawave-nginx"'; then
-    echo "ERROR: ${NETWORK_NAME} 中缺少 remnawave-nginx。"
-    exit 1
-fi
+for c in remnawave remnawave-nginx; do
+    if ! container_in_network "${c}"; then
+        echo "ERROR: ${NETWORK_NAME} 中缺少 ${c}。"
+        docker network inspect "${NETWORK_NAME}" || true
+        exit 1
+    fi
+done
 
 echo "OK: 两个容器共用 ${NETWORK_NAME}"
 
@@ -1484,9 +1525,11 @@ fi
 echo
 echo ">>> HTTP -> HTTPS 跳转测试 ..."
 
-if curl -fsSI --max-time 15 \
+REDIRECT_HEAD="$(curl -sSI --max-time 15 \
     --resolve "${MAIN_DOMAIN}:80:127.0.0.1" \
-    "http://${MAIN_DOMAIN}/" | grep -qiE "301|302"; then
+    "http://${MAIN_DOMAIN}/" 2>/dev/null || true)"
+
+if str_has "${REDIRECT_HEAD}" " 301 " || str_has "${REDIRECT_HEAD}" " 302 "; then
     echo "OK: HTTP 已跳转 HTTPS。"
 else
     echo "WARNING: HTTP 跳转未返回 301/302。"
