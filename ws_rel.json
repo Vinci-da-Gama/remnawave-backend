@@ -13,7 +13,7 @@
                 "decryption": "none"
             },
             "streamSettings": {
-                "network": "websocket",
+                "network": "ws",
                 "security": "tls",
                 "tlsSettings": {
                     "serverName": "<<<必改1/REPLACE1>>> 节点域名/your node domain, e.g. n1.example.com",
